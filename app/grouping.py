@@ -5,6 +5,8 @@
 1. 同一相机（camera_no）的照片按 (拍摄时间, 照片号) 升序排列；
    相邻两张照片间隔 <= gap_seconds 秒即归入同一"出没事件组"，
    分组具有传递性（链式桥接的照片同属一组）。
+   拍摄时间保留小数秒精度，间隔按真实时刻差计算（如 60.8 秒 > 60 即分组，
+   不做整秒截断）。
 2. 组的稳定标识 group_id = 组内最早照片的 photo_no
    （时间相同取 photo_no 较小者）。
 3. 训练/验证按组整体划分（同一组不会跨训练与验证，避免同一出没
@@ -23,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Sequence
 
-DEFAULT_GAP_SECONDS = 60
+DEFAULT_GAP_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -44,8 +46,11 @@ class Group:
     photos: tuple[Photo, ...]  # 按 (captured_at, photo_no) 升序
 
 
-def compute_groups(photos: Sequence[Photo], gap_seconds: int = DEFAULT_GAP_SECONDS) -> list[Group]:
-    """把照片按相机分组、按时间链式归并，返回稳定的组列表。"""
+def compute_groups(photos: Sequence[Photo], gap_seconds: float = DEFAULT_GAP_SECONDS) -> list[Group]:
+    """把照片按相机分组、按时间链式归并，返回稳定的组列表。
+
+    间隔按真实时刻差（含小数秒）与 gap_seconds 比较。
+    """
     by_camera: dict[str, list[Photo]] = {}
     for p in photos:
         by_camera.setdefault(p.camera_no, []).append(p)

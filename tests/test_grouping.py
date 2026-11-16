@@ -28,6 +28,43 @@ def test_exactly_60s_stays_together():
     assert len(compute_groups(photos)) == 1
 
 
+def test_fractional_gap_over_60s_splits():
+    # 60.8 秒间隔必须分组（回归：整秒截断曾把它当成 60 秒而错误并组）
+    photos = [p("P1", "C1", 0), p("P2", "C1", 60.8)]
+    assert len(compute_groups(photos)) == 2
+
+
+def test_fractional_gap_exactly_60s_stays_together():
+    # 带小数秒恰好 60.0 秒：仍在阈值内，同组
+    photos = [p("P1", "C1", 0.5), p("P2", "C1", 60.5)]
+    assert len(compute_groups(photos)) == 1
+
+
+def test_fractional_gap_just_under_60s_stays_together():
+    # 59.9 秒：同组
+    photos = [p("P1", "C1", 0.2), p("P2", "C1", 60.1)]
+    assert len(compute_groups(photos)) == 1
+
+
+def test_mixed_whole_and_fractional_seconds_grouping():
+    # 旧库整秒照片与新增小数秒照片混用：按真实时刻归组
+    # 0 -> 30.5（间隔 30.5）同组；30.5 -> 60.8（间隔 30.3）同组，链式合并为一组
+    photos = [p("P1", "C1", 0), p("P2", "C1", 30.5), p("P3", "C1", 60.8)]
+    groups = compute_groups(photos)
+    assert len(groups) == 1
+    assert [x.photo_no for x in groups[0].photos] == ["P1", "P2", "P3"]
+    # 整秒照片与 60.8 秒后的小数秒照片：必须分组
+    assert len(compute_groups([p("P1", "C1", 0), p("P3", "C1", 60.8)])) == 2
+
+
+def test_subsecond_ordering_within_group():
+    # 同一秒内的小数时刻按真实先后排序，而非照片号
+    photos = [p("P9", "C1", 0.5), p("P1", "C1", 0.2)]
+    (g,) = compute_groups(photos)
+    assert [x.photo_no for x in g.photos] == ["P1", "P9"]
+    assert g.group_id == "P1"
+
+
 def test_cameras_are_independent():
     photos = [p("P1", "C1", 0), p("P2", "C2", 10)]
     groups = compute_groups(photos)

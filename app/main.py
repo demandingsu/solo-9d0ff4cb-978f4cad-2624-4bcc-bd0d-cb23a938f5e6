@@ -49,7 +49,7 @@ STATUS_LABELS = {
 class Settings:
     data_dir: Path
     val_percent: int = 20
-    gap_seconds: int = 60
+    gap_seconds: float = 60.0
     split_salt: str = "wildlife-trap-v1"
     samples_dir: Path | None = None
 
@@ -68,34 +68,54 @@ class Settings:
         return cls(
             data_dir=Path(os.environ.get("DATA_DIR", "./data")).resolve(),
             val_percent=int(os.environ.get("VAL_PERCENT", "20")),
-            gap_seconds=int(os.environ.get("GAP_SECONDS", "60")),
+            gap_seconds=float(os.environ.get("GAP_SECONDS", "60")),
             split_salt=os.environ.get("SPLIT_SALT", "wildlife-trap-v1"),
             samples_dir=samples_dir if samples_dir and samples_dir.is_dir() else None,
         )
 
 
 # ---------------------------------------------------------------- 时间
+#
+# 精度链路：CSV 里的 captured_at 一律解析为微秒级 UTC 时刻，判重、排序、
+# 相邻间隔计算全部基于该真实时刻，不做整秒截断。存储/索引输出使用规范形式：
+# 整秒 -> "2026-03-01T08:00:00Z"（与旧库整秒数据字节一致）；
+# 带小数秒 -> "2026-03-01T08:00:00.500Z"（毫秒）或 "...T08:00:00.123456Z"（微秒）。
+# 等价时区写法（如 +08:00 与 Z）换算为同一 UTC 时刻后视为同一时间。
 
 def utcnow_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def ts_str(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """UTC 时刻的规范字符串：整秒不带小数，非整秒保留毫秒/微秒。"""
+    dt = dt.astimezone(timezone.utc)
+    base = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    if dt.microsecond == 0:
+        return base + "Z"
+    if dt.microsecond % 1000 == 0:
+        return f"{base}.{dt.microsecond // 1000:03d}Z"
+    return f"{base}.{dt.microsecond:06d}Z"
 
 
 def parse_timestamp(raw: str) -> datetime:
+    """解析 ISO8601 时间戳为微秒级 UTC 时刻（保留小数秒）。
+
+    支持 "Z"、数值时区偏移（换算为 UTC）与无时区写法（按 UTC 处理）。
+    """
     s = raw.strip()
     if not s:
         raise ValueError("空时间戳")
-    dt = datetime.fromisoformat(s)  # 支持 "...Z" 与偏移；naive 视为 UTC
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)  # 支持小数秒与时区偏移；naive 视为 UTC
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.astimezone(timezone.utc)
 
 
 def parse_stored_ts(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    """解析库中存储的 captured_at（兼容旧库整秒 "...Z" 与新增小数秒两种写法）。"""
+    return parse_timestamp(s)
 
 
 # ---------------------------------------------------------------- 数据库
@@ -115,7 +135,7 @@ CREATE TABLE IF NOT EXISTS batches (
 CREATE TABLE IF NOT EXISTS photos (
     photo_no TEXT PRIMARY KEY,
     camera_no TEXT NOT NULL,
-    captured_at TEXT NOT NULL,         -- ISO8601 UTC, 秒精度
+    captured_at TEXT NOT NULL,         -- ISO8601 UTC，可含小数秒（旧数据为整秒 "...Z"）
     species TEXT NOT NULL,
     rel_path TEXT NOT NULL,
     batch_id INTEGER NOT NULL REFERENCES batches(id)
@@ -226,7 +246,7 @@ def parse_csv(data: bytes) -> tuple[list[CsvRow], list[str]]:
         try:
             captured_at = parse_timestamp(ts_raw)
         except ValueError:
-            row_errs.append(f"captured_at 无法解析: {ts_raw!r}（需 ISO8601，如 2026-03-01T08:00:00Z）")
+            row_errs.append(f"captured_at 无法解析: {ts_raw!r}（需 ISO8601，如 2026-03-01T08:00:00.500Z）")
 
         if row_errs:
             errors.append(f"第{lineno}行: " + "；".join(row_errs))
@@ -246,6 +266,12 @@ def parse_csv(data: bytes) -> tuple[list[CsvRow], list[str]]:
 
 
 # ---------------------------------------------------------------- 索引文件
+
+def index_sort_key(row: dict) -> tuple[str, datetime, str]:
+    """索引行排序键：按真实 UTC 时刻排序（整秒与小数秒混排时字符串序不可靠，
+    如 "08:00:00.500Z" 的 '.' 排在 "08:00:00Z" 的 'Z' 之前）。"""
+    return (row["camera_no"], parse_stored_ts(row["captured_at"]), row["photo_no"])
+
 
 def _write_index_csv(path: Path, rows: list[dict]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -361,9 +387,8 @@ def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tupl
                     "rel_path": p.rel_path,
                     "group_id": g.group_id,
                 })
-        key = lambda r: (r["camera_no"], r["captured_at"], r["photo_no"])
-        train_rows.sort(key=key)
-        val_rows.sort(key=key)
+        train_rows.sort(key=index_sort_key)
+        val_rows.sort(key=index_sort_key)
 
         now = utcnow_str()
         cur = conn.execute(
@@ -483,9 +508,11 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
 <button class="btn" type="submit">上传并发布</button></p>
 </form>
 <p class="muted">必需列：<code>{'</code> <code>'.join(REQUIRED_COLUMNS)}</code>；
-时间为 UTC（ISO8601，如 <code>2026-03-01T08:00:00Z</code>）。
-同一相机相邻 ≤{settings.gap_seconds} 秒的照片传递归组；按组稳定划分（验证集比例 {settings.val_percent}%）。
-同号同内容重投不产生新版本；同号异内容整批拒绝。</p></div>"""
+拍摄时间为 ISO8601，支持小数秒（如 <code>2026-03-01T08:00:00.500Z</code>）；
+带时区偏移会换算为 UTC，等价写法视为同一时刻；无时区按 UTC 处理。
+同一相机相邻 ≤{settings.gap_seconds:g} 秒（按真实时刻计算，含小数秒）的照片传递归组；
+按组稳定划分（验证集比例 {settings.val_percent}%）。
+同号同内容重投不产生新版本；同号异内容（含仅小数秒不同）整批拒绝。</p></div>"""
 
     # 样例
     samples_html = ""
@@ -502,6 +529,9 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
 把旧两组合并成一组，全库重新归组；P0008 加入 CAM02 旧组。</li>
 <li>上传 <code>batch3_duplicate.csv</code>（与 batch2 完全相同）→ 不产生新版本。</li>
 <li>上传 <code>batch4_conflict.csv</code>（P0001 内容被改动）→ 整批拒绝，现役版本保持 v2。</li>
+<li>上传 <code>batch5_fractional.csv</code>（带小数秒的补传）→ 发布 v3：P0010（08:02:40.500）
+距 P0006 仅 30.5 秒，并入 CAM01 大组；P0012 距 P0009 60.8 秒 &gt; 60 秒阈值，单独成组
+（按真实时刻计算间隔，不截断小数秒）。</li>
 <li>随时打开 v1 的下载链接，内容保持最初发布时的原样。</li>
 </ol></div>"""
 
@@ -568,10 +598,11 @@ def version_detail_page(settings: Settings, vid: int) -> str:
                 g["rows"].append(row)
 
     grows = []
-    for gid in sorted(groups, key=lambda g: (min(r["captured_at"] for r in groups[g]["rows"]), g)):
+    for gid in sorted(groups, key=lambda g: (min(parse_stored_ts(r["captured_at"]) for r in groups[g]["rows"]), g)):
         g = groups[gid]
-        times = sorted(r["captured_at"] for r in g["rows"])
-        members = ", ".join(r["photo_no"] for r in sorted(g["rows"], key=lambda r: (r["captured_at"], r["photo_no"])))
+        ordered = sorted(g["rows"], key=lambda r: (parse_stored_ts(r["captured_at"]), r["photo_no"]))
+        times = [r["captured_at"] for r in ordered]
+        members = ", ".join(r["photo_no"] for r in ordered)
         split_label = "验证" if g["split"] == "val" else "训练"
         grows.append(
             f"<tr><td>{escape(gid)}</td><td>{escape(g['rows'][0]['camera_no'])}</td>"
@@ -608,9 +639,11 @@ def batch_detail_page(settings: Settings, bid: int) -> str:
         conn = connect(settings)
         try:
             photos = conn.execute(
-                "SELECT photo_no, camera_no, captured_at, species, rel_path FROM photos WHERE batch_id=? ORDER BY camera_no, captured_at, photo_no",
+                "SELECT photo_no, camera_no, captured_at, species, rel_path FROM photos WHERE batch_id=?",
                 (bid,),
             ).fetchall()
+            # 按真实时刻排序（整秒与小数秒混排时字符串序不可靠）
+            photos = sorted(photos, key=lambda p: (p["camera_no"], parse_stored_ts(p["captured_at"]), p["photo_no"]))
         finally:
             conn.close()
     prows = "".join(

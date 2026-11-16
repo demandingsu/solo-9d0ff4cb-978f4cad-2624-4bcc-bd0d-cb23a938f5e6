@@ -204,3 +204,110 @@ def test_version_detail_shows_groups(env):
     r = client.get("/versions/1")
     assert r.status_code == 200
     assert "P0002" in r.text and "出没事件分组" in r.text
+
+
+# ---------------------------------------------------------------- 小数秒精度链路
+
+FRAC_BATCH = make_csv([
+    ["P1001", "CAM01", "2026-03-01T08:00:00Z", "wild_boar", "cam01/P1001.jpg"],
+    ["P1002", "CAM01", "2026-03-01T08:01:00.800Z", "wild_boar", "cam01/P1002.jpg"],  # 距 P1001 60.8 秒 -> 必须分组
+    ["P1003", "CAM01", "2026-03-01T08:01:30.500Z", "wild_boar", "cam01/P1003.jpg"],  # 距 P1002 29.7 秒 -> 同组
+])
+
+
+def fetch_all_rows(client, vid):
+    return fetch_index(client, vid, "train_index.csv") + fetch_index(client, vid, "val_index.csv")
+
+
+def test_fractional_boundary_grouping_and_storage(env):
+    """60.8 秒间隔必须分组（修复前被截断为 60 秒而错误并组）；索引保留小数秒。"""
+    client, settings = env
+    r = upload(client, FRAC_BATCH, "frac.csv")
+    assert "已发布版本 v1" in r.text
+    rows = fetch_all_rows(client, 1)
+    assert len(rows) == 3
+    g = {r["photo_no"]: r["group_id"] for r in rows}
+    assert g["P1001"] != g["P1002"]      # 60.8s > 60s：两组
+    assert g["P1002"] == g["P1003"]      # 29.7s：同组
+    at = {r["photo_no"]: r["captured_at"] for r in rows}
+    assert at["P1001"] == "2026-03-01T08:00:00Z"        # 整秒保持旧格式
+    assert at["P1002"] == "2026-03-01T08:01:00.800Z"    # 小数秒原样保留
+    assert at["P1003"] == "2026-03-01T08:01:30.500Z"
+
+
+def test_subsecond_change_same_photo_no_rejects_batch(env):
+    """同号照片只改小数秒 -> 内容不同 -> 整批拒绝（修复前误判为原件重投）。"""
+    client, settings = env
+    upload(client, FRAC_BATCH, "frac.csv")
+    changed = make_csv([
+        ["P1002", "CAM01", "2026-03-01T08:01:00.900Z", "wild_boar", "cam01/P1002.jpg"],  # 仅小数秒被改
+        ["P1004", "CAM01", "2026-03-01T08:02:00Z", "wild_boar", "cam01/P1004.jpg"],      # 全新照片也不许入库
+    ])
+    r = upload(client, changed, "changed.csv")
+    assert "整批拒绝" in r.text
+    assert db_count(settings, "photos") == 3
+    assert db_count(settings, "versions") == 1
+    assert "v1" in client.get("/").text
+
+
+def test_equivalent_timezone_treated_as_same_instant(env):
+    """等价时区写法（+08:00 与 Z）视为同一时刻 -> 判为重投，不产生新版本。"""
+    client, settings = env
+    upload(client, FRAC_BATCH, "frac.csv")
+    same = make_csv([
+        ["P1002", "CAM01", "2026-03-01T16:01:00.800+08:00", "wild_boar", "cam01/P1002.jpg"],
+        ["P1003", "CAM01", "2026-03-01T08:01:30.500000+00:00", "wild_boar", "cam01/P1003.jpg"],
+    ])
+    r = upload(client, same, "tz.csv")
+    assert "未产生新版本" in r.text
+    assert db_count(settings, "versions") == 1
+    assert db_count(settings, "photos") == 3
+
+
+def test_fractional_reupload_is_noop(env):
+    """带小数秒的批次原样重投 -> noop，不产生新版本。"""
+    client, settings = env
+    upload(client, FRAC_BATCH, "frac.csv")
+    r = upload(client, FRAC_BATCH, "frac-again.csv")
+    assert "未产生新版本" in r.text
+    assert db_count(settings, "versions") == 1
+    assert db_count(settings, "photos") == 3
+
+
+def test_mixed_whole_second_and_fractional_across_batches(env):
+    """旧库整秒照片与新增小数秒照片混用：跨批归组按真实时刻计算。"""
+    client, settings = env
+    upload(client, BATCH1, "b1.csv")  # 整秒旧数据
+    backfill = make_csv([
+        ["P0007", "CAM01", "2026-03-01T08:01:05.500Z", "wild_boar", "cam01/P0007.jpg"],  # 桥接 CAM01 两旧组
+        ["P0010", "CAM03", "2026-03-01T12:00:00Z", "sika_deer", "cam03/P0010.jpg"],
+    ])
+    r = upload(client, backfill, "b2.csv")
+    assert "已发布版本 v2" in r.text
+    later = make_csv([
+        ["P0011", "CAM03", "2026-03-01T12:01:00.800Z", "sika_deer", "cam03/P0011.jpg"],  # 距 P0010 60.8 秒 -> 新组
+    ])
+    r = upload(client, later, "b3.csv")
+    assert "已发布版本 v3" in r.text
+
+    rows = fetch_all_rows(client, 3)
+    g = {r["photo_no"]: r["group_id"] for r in rows}
+    # 小数秒桥接照片把 CAM01 旧两组合并，沿用最早组标识
+    assert g["P0002"] == g["P0005"] == g["P0007"] == "P0002"
+    # 60.8 秒间隔必须分组
+    assert g["P0011"] != g["P0010"]
+
+
+def test_index_sorted_by_true_instant_with_mixed_precision(env):
+    """整秒与小数秒混排时索引按真实时刻排序（字符串序会把 .500Z 排到 00Z 之前）。"""
+    client, settings = env
+    upload(client, make_csv([
+        ["P2001", "CAM01", "2026-03-01T08:00:00Z", "boar", "c1/P2001.jpg"],
+        ["P2003", "CAM01", "2026-03-01T08:00:30Z", "boar", "c1/P2003.jpg"],
+    ]), "b1.csv")
+    upload(client, make_csv([
+        ["P2002", "CAM01", "2026-03-01T08:00:00.500Z", "boar", "c1/P2002.jpg"],
+    ]), "b2.csv")
+    rows = fetch_all_rows(client, 2)
+    cam01 = [r["photo_no"] for r in rows if r["camera_no"] == "CAM01"]
+    assert cam01 == ["P2001", "P2002", "P2003"]
